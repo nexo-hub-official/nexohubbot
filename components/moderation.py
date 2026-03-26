@@ -14,9 +14,112 @@ class Moderation(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self.mod_log_channel_id = 1486610796787269732
+        self._case_counter = 0
         self._recent_messages: DefaultDict[int, Deque[float]] = defaultdict(
             lambda: deque(maxlen=8)
         )
+
+    def _next_case_id(self) -> int:
+        self._case_counter += 1
+        return self._case_counter
+
+    def _mod_log_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
+        channel = guild.get_channel(self.mod_log_channel_id)
+        return channel if isinstance(channel, discord.TextChannel) else None
+
+    def _build_dm_embed(
+        self,
+        *,
+        action: str,
+        moderator: discord.abc.User,
+        time_text: str,
+        case_id: int,
+        reason: str,
+    ) -> discord.Embed:
+        embed = discord.Embed(
+            title="Moderation Notice",
+            description=(
+                "A moderation action has been applied to you.\n\n"
+                f"Punishment: {action}\n"
+                f"Moderator: {moderator}\n"
+                f"Time: {time_text}\n"
+                f"Case ID: {case_id}\n"
+                f"Reason: {reason}"
+            ),
+            color=discord.Color.red(),
+        )
+        return embed
+
+    def _build_log_embed(
+        self,
+        *,
+        action: str,
+        target: discord.abc.User,
+        moderator: discord.abc.User,
+        time_text: str,
+        case_id: int,
+        reason: str,
+    ) -> discord.Embed:
+        embed = discord.Embed(title="Moderation Log", color=discord.Color.green())
+        embed.add_field(name="Action", value=action, inline=True)
+        embed.add_field(name="Target", value=f"{target} (`{target.id}`)", inline=True)
+        embed.add_field(
+            name="Moderator",
+            value=f"{moderator} (`{moderator.id}`)",
+            inline=True,
+        )
+        embed.add_field(name="Time", value=time_text, inline=True)
+        embed.add_field(name="Case ID", value=str(case_id), inline=True)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        return embed
+
+    async def _send_punishment_dm(
+        self,
+        *,
+        member: discord.abc.User,
+        action: str,
+        moderator: discord.abc.User,
+        time_text: str,
+        case_id: int,
+        reason: str,
+    ) -> None:
+        embed = self._build_dm_embed(
+            action=action,
+            moderator=moderator,
+            time_text=time_text,
+            case_id=case_id,
+            reason=reason,
+        )
+        try:
+            await member.send(embed=embed)
+        except discord.HTTPException:
+            pass
+
+    async def _send_mod_log(
+        self,
+        *,
+        guild: discord.Guild,
+        target: discord.abc.User,
+        action: str,
+        moderator: discord.abc.User,
+        time_text: str,
+        case_id: int,
+        reason: str,
+    ) -> None:
+        channel = self._mod_log_channel(guild)
+        if channel is None:
+            return
+
+        embed = self._build_log_embed(
+            action=action,
+            target=target,
+            moderator=moderator,
+            time_text=time_text,
+            case_id=case_id,
+            reason=reason,
+        )
+        await channel.send(embed=embed)
 
     async def _ensure_manageable(
         self,
@@ -69,7 +172,25 @@ class Moderation(commands.Cog):
         if not await self._ensure_manageable(ctx, member, "kick"):
             return
 
+        case_id = self._next_case_id()
+        await self._send_punishment_dm(
+            member=member,
+            action="Kick",
+            moderator=ctx.author,
+            time_text="Permanent",
+            case_id=case_id,
+            reason=reason,
+        )
         await member.kick(reason=f"{ctx.author} | {reason}")
+        await self._send_mod_log(
+            guild=ctx.guild,
+            target=member,
+            action="Kick",
+            moderator=ctx.author,
+            time_text="Permanent",
+            case_id=case_id,
+            reason=reason,
+        )
         await ctx.send(f"👢 Kicked {member.mention} • Reason: {reason}")
 
     @commands.command(name="ban")
@@ -85,7 +206,28 @@ class Moderation(commands.Cog):
         if not await self._ensure_manageable(ctx, member, "ban"):
             return
 
-        await member.ban(reason=f"{ctx.author} | {reason}", delete_message_days=1)
+        case_id = self._next_case_id()
+        await self._send_punishment_dm(
+            member=member,
+            action="Ban",
+            moderator=ctx.author,
+            time_text="Permanent",
+            case_id=case_id,
+            reason=reason,
+        )
+        await member.ban(
+            reason=f"{ctx.author} | {reason}",
+            delete_message_seconds=604800,
+        )
+        await self._send_mod_log(
+            guild=ctx.guild,
+            target=member,
+            action="Ban",
+            moderator=ctx.author,
+            time_text="Permanent",
+            case_id=case_id,
+            reason=reason,
+        )
         await ctx.send(f"🔨 Banned {member.mention} • Reason: {reason}")
 
     @commands.command(name="unban")
@@ -112,7 +254,25 @@ class Moderation(commands.Cog):
 
         minutes = max(1, min(minutes, 40320))
         until = discord.utils.utcnow() + timedelta(minutes=minutes)
+        case_id = self._next_case_id()
+        await self._send_punishment_dm(
+            member=member,
+            action="Mute",
+            moderator=ctx.author,
+            time_text=f"{minutes} minute(s)",
+            case_id=case_id,
+            reason=reason,
+        )
         await member.timeout(until, reason=f"{ctx.author} | {reason}")
+        await self._send_mod_log(
+            guild=ctx.guild,
+            target=member,
+            action="Mute",
+            moderator=ctx.author,
+            time_text=f"{minutes} minute(s)",
+            case_id=case_id,
+            reason=reason,
+        )
         await ctx.send(
             f"🔇 Muted {member.mention} for {minutes} minute(s) • Reason: {reason}"
         )
@@ -145,10 +305,29 @@ class Moderation(commands.Cog):
         if not await self._ensure_manageable(ctx, member, "warn"):
             return
 
+        case_id = self._next_case_id()
+        await self._send_punishment_dm(
+            member=member,
+            action="Warn",
+            moderator=ctx.author,
+            time_text="N/A",
+            case_id=case_id,
+            reason=reason,
+        )
+        await self._send_mod_log(
+            guild=ctx.guild,
+            target=member,
+            action="Warn",
+            moderator=ctx.author,
+            time_text="N/A",
+            case_id=case_id,
+            reason=reason,
+        )
         embed = discord.Embed(title="⚠️ Warning Issued", color=0xF1C40F)
         embed.add_field(name="Member", value=member.mention, inline=False)
         embed.add_field(name="Moderator", value=ctx.author.mention, inline=False)
         embed.add_field(name="Reason", value=reason, inline=False)
+        embed.add_field(name="Case ID", value=str(case_id), inline=False)
         await ctx.send(embed=embed)
 
     @commands.Cog.listener()

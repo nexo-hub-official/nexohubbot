@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import discord
 from discord import app_commands
@@ -14,11 +16,12 @@ from discord.ext import commands
 
 @dataclass
 class VerificationState:
+    user_id: int
     token: str
     target: int
     counter_a: int = 0
     counter_b: int = 0
-    started_at: datetime = datetime.now(timezone.utc)
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -28,105 +31,6 @@ class VerificationState:
             "counter_b": self.counter_b,
             "started_at": self.started_at.isoformat(),
         }
-
-
-class VerificationView(discord.ui.View):
-    def __init__(self, cog: "WebPanelVerification", user_id: int) -> None:
-        super().__init__(timeout=300)
-        self.cog = cog
-        self.user_id = user_id
-
-    async def _update_progress(
-        self,
-        interaction: discord.Interaction,
-        lane: str | None,
-        *,
-        reset: bool = False,
-    ) -> None:
-        state = self.cog.verifications.get(self.user_id)
-        if state is None:
-            await interaction.response.send_message(
-                "No active verification session found. Run /verify-start again.",
-                ephemeral=True,
-            )
-            return
-
-        if reset:
-            state.counter_a = 0
-            state.counter_b = 0
-            self.cog.total_resets += 1
-        elif lane == "a":
-            state.counter_a += 1
-        elif lane == "b":
-            state.counter_b += 1
-
-        if state.counter_a > state.target or state.counter_b > state.target:
-            self.cog.total_failures += 1
-            del self.cog.verifications[self.user_id]
-            await interaction.response.edit_message(
-                content=(
-                    "❌ Verification failed (counter exceeded target). "
-                    "Run /verify-start to try again."
-                ),
-                view=None,
-            )
-            return
-
-        if state.counter_a == state.target and state.counter_b == state.target:
-            self.cog.total_completed += 1
-            self.cog.verified_users.add(self.user_id)
-            del self.cog.verifications[self.user_id]
-            await interaction.response.edit_message(
-                content="✅ Verification complete! Double counter reached target on both lanes.",
-                view=None,
-            )
-            return
-
-        await interaction.response.edit_message(
-            content=(
-                f"Double Counter Verification\n"
-                f"Target: **{state.target}**\n"
-                f"Counter A: **{state.counter_a}**\n"
-                f"Counter B: **{state.counter_b}**"
-            ),
-            view=self,
-        )
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message(
-                "Only the user who started this verification can use these buttons.",
-                ephemeral=True,
-            )
-            return False
-        return True
-
-    @discord.ui.button(label="Counter A +1", style=discord.ButtonStyle.primary)
-    async def counter_a_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        del button
-        await self._update_progress(interaction, "a")
-
-    @discord.ui.button(label="Counter B +1", style=discord.ButtonStyle.success)
-    async def counter_b_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        del button
-        await self._update_progress(interaction, "b")
-
-    @discord.ui.button(label="Reset", style=discord.ButtonStyle.secondary)
-    async def reset_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        del button
-        await self._update_progress(interaction, None, reset=True)
 
 
 class WebPanelVerification(commands.Cog):
@@ -143,6 +47,7 @@ class WebPanelVerification(commands.Cog):
         self._server: asyncio.base_events.Server | None = None
         self._host = "0.0.0.0"
         self._port = 8080
+        self._public_base_url = os.getenv("WEB_PANEL_PUBLIC_URL", "").rstrip("/")
 
     async def cog_load(self) -> None:
         self._server = await asyncio.start_server(self._handle_http_client, self._host, self._port)
@@ -169,6 +74,92 @@ class WebPanelVerification(commands.Cog):
             ],
         }
 
+    def _state_by_token(self, token: str) -> VerificationState | None:
+        for state in self.verifications.values():
+            if state.token == token:
+                return state
+        return None
+
+    def _remove_verification(self, user_id: int) -> None:
+        if user_id in self.verifications:
+            del self.verifications[user_id]
+
+    def _apply_action(self, state: VerificationState, action: str) -> str | None:
+        if action == "inc_a":
+            state.counter_a += 1
+        elif action == "inc_b":
+            state.counter_b += 1
+        elif action == "reset":
+            state.counter_a = 0
+            state.counter_b = 0
+            self.total_resets += 1
+
+        if state.counter_a > state.target or state.counter_b > state.target:
+            self.total_failures += 1
+            self._remove_verification(state.user_id)
+            return "❌ Verification failed (counter exceeded target). Run /verify-start again."
+
+        if state.counter_a == state.target and state.counter_b == state.target:
+            self.total_completed += 1
+            self.verified_users.add(state.user_id)
+            self._remove_verification(state.user_id)
+            return "✅ Verification complete. You can return to Discord."
+
+        return None
+
+    def _verification_page(
+        self,
+        *,
+        token: str,
+        state: VerificationState | None,
+        status: str | None = None,
+    ) -> str:
+        if state is None:
+            return """
+<!doctype html>
+<html><body style='font-family:Arial;background:#0e1117;color:#e6edf3;padding:2rem;'>
+<h1>Verification Session Not Found</h1>
+<p>This session is expired or invalid. Run <strong>/verify-start</strong> again in Discord.</p>
+</body></html>
+"""
+
+        status_html = f"<p><strong>{status}</strong></p>" if status else ""
+        return f"""
+<!doctype html>
+<html>
+  <head>
+    <meta charset='utf-8'>
+    <meta name='viewport' content='width=device-width,initial-scale=1'>
+    <title>Double Counter Verification</title>
+    <style>
+      body {{ font-family: Arial, sans-serif; background: #0e1117; color: #e6edf3; margin: 2rem; }}
+      .card {{ background: #161b22; border-radius: 12px; padding: 1rem; max-width: 520px; }}
+      .counter {{ display: inline-block; min-width: 90px; font-size: 2rem; font-weight: 700; }}
+      .row {{ margin: 1rem 0; display:flex; justify-content:space-between; align-items:center; }}
+      .actions {{ display: flex; gap: 0.6rem; flex-wrap: wrap; margin-top: 1rem; }}
+      a.button {{ text-decoration: none; color: #fff; background: #238636; padding: 0.6rem 0.9rem; border-radius: 8px; }}
+      a.secondary {{ background: #30363d; }}
+      .muted {{ color: #8b949e; }}
+    </style>
+  </head>
+  <body>
+    <div class='card'>
+      <h1>Double Counter</h1>
+      <p class='muted'>Match both counters to the target exactly.</p>
+      {status_html}
+      <div class='row'><span>Target</span><span class='counter'>{state.target}</span></div>
+      <div class='row'><span>Counter A</span><span class='counter'>{state.counter_a}</span></div>
+      <div class='row'><span>Counter B</span><span class='counter'>{state.counter_b}</span></div>
+      <div class='actions'>
+        <a class='button' href='/verify/{token}?action=inc_a'>Counter A +1</a>
+        <a class='button' href='/verify/{token}?action=inc_b'>Counter B +1</a>
+        <a class='button secondary' href='/verify/{token}?action=reset'>Reset</a>
+      </div>
+    </div>
+  </body>
+</html>
+"""
+
     async def _handle_http_client(
         self,
         reader: asyncio.StreamReader,
@@ -176,15 +167,30 @@ class WebPanelVerification(commands.Cog):
     ) -> None:
         data = await reader.read(4096)
         request_line = data.decode("utf-8", errors="ignore").splitlines()
+        method = "GET"
         path = "/"
         if request_line:
             parts = request_line[0].split(" ")
-            if len(parts) >= 2:
+            if len(parts) >= 3:
+                method = parts[0].upper()
                 path = parts[1]
 
         if path == "/api/status":
             body = json.dumps(self._panel_payload(), indent=2)
             content_type = "application/json"
+        elif path.startswith("/verify/") and method == "GET":
+            parsed = urlparse(path)
+            token = parsed.path.removeprefix("/verify/").strip("/")
+            query = parse_qs(parsed.query)
+            action = query.get("action", [None])[0]
+            state = self._state_by_token(token)
+            status = None
+            if state and action:
+                status = self._apply_action(state, action)
+                state = self._state_by_token(token)
+
+            body = self._verification_page(token=token, state=state, status=status)
+            content_type = "text/html; charset=utf-8"
         else:
             stats = self._panel_payload()
             rows = "".join(
@@ -256,19 +262,26 @@ class WebPanelVerification(commands.Cog):
     @app_commands.command(name="verify-start", description="Start double-counter verification.")
     async def verify_start(self, interaction: discord.Interaction) -> None:
         target = secrets.randbelow(3) + 2  # target range 2-4 inclusive
-        state = VerificationState(token=secrets.token_hex(6), target=target)
+        state = VerificationState(
+            user_id=interaction.user.id,
+            token=secrets.token_hex(12),
+            target=target,
+        )
         self.verifications[interaction.user.id] = state
         self.total_started += 1
 
-        view = VerificationView(self, interaction.user.id)
+        if self._public_base_url:
+            verification_url = f"{self._public_base_url}/verify/{state.token}"
+        else:
+            verification_url = f"http://localhost:{self._port}/verify/{state.token}"
+
         await interaction.response.send_message(
             content=(
-                "Double Counter Verification\n"
+                "Double Counter Verification started.\n"
+                f"Open this link and complete the challenge: {verification_url}\n"
                 f"Target: **{target}**\n"
-                "Press Counter A and Counter B buttons until both match the target exactly.\n"
-                "If either counter exceeds target, verification fails."
+                "You must match both counters to the target exactly."
             ),
-            view=view,
             ephemeral=True,
         )
 
