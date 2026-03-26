@@ -1,0 +1,19 @@
+{
+  "name": "nexohubbot",
+  "version": "1.0.0",
+  "description": "Node.js Discord bot with backend API and frontend dashboard",
+  "type": "module",
+  "main": "backend/src/server.js",
+  "scripts": {
+    "start": "node backend/src/server.js",
+    "check": "node --check backend/src/server.js && node --check backend/src/discord/bot.js && node --check frontend/app.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "discord.js": "^14.19.3",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  }
+}
