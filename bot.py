@@ -4,6 +4,10 @@ Setup:
 1. Install dependency: `pip install discord.py`
 2. Set your bot token: `export DISCORD_BOT_TOKEN=your_token_here`
 3. Run: `python bot.py`
+
+Web app (Flask):
+1. Install dependencies: `pip install -r requirements.txt`
+2. Run: `python web_app.py`
 """
 
 from __future__ import annotations
