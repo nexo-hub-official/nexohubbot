@@ -26,6 +26,7 @@ COMPONENT_EXTENSIONS = [
     "components.message_builder",
     "components.moderation",
     "components.polls_filter",
+    "components.web_panel",
 ]
 
 ROLE_IDS = {
